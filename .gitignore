@@ -1,0 +1,14 @@
+/00.secret/
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+node_modules/
+dist/
+build/
+*.log
+
+/GitSecurityTool/GitSecurityTool/.secret_detected.log
+!/03.log/

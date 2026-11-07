@@ -1,0 +1,89 @@
+repos:
+  # =========================
+  # ■ Secret Detection (最重要)
+  # =========================
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.2
+    hooks:
+      - id: gitleaks
+        args:
+          - "--verbose"
+          - "--redact"
+          - "--config=GitSecurityTool/GitSecurityTool/.gitleaks.toml"
+
+  # =========================
+  # ■ Basic Safety Checks
+  # =========================
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+        exclude: ^Top\.png$
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+
+  # =========================
+  # ■ Prevent committing .env accidentally
+  # =========================
+  - repo: local
+    hooks:
+      - id: block-env-files
+        name: Block .env files
+        entry: python GitSecurityTool/GitSecurityTool/block_secret.py
+        language: system
+        args: ["--mode", "env"]
+
+  # =========================
+  # ■ Prevent committing Secret folders
+  # =========================
+      - id: block-secret-folder
+        name: Block Secret folders
+        entry: python GitSecurityTool/GitSecurityTool/block_secret.py
+        language: system
+        args: ["--mode", "secret"]
+
+  # =========================
+  # ■ 個人メール検知（強め）
+  # =========================
+      - id: block-personal-email
+        name: Block personal email
+        entry: python GitSecurityTool/GitSecurityTool/block_secret.py
+        language: system
+        args: ["--mode", "personal_email"]
+
+  # =========================
+  # ■ 自分の名前（ローカル専用）
+  # =========================
+      - id: block-my-name
+        name: Block my name
+        entry: python GitSecurityTool/GitSecurityTool/block_secret.py
+        language: system
+        args: ["--mode", "my_name"]
+
+  # =========================
+  # ■ 会社名
+  # =========================
+      - id: block-company
+        name: Block company name
+        entry: python GitSecurityTool/GitSecurityTool/block_secret.py
+        language: system
+        args: ["--mode", "company"]
+
+  # =========================
+  # ■ Windowsパス検知
+  # =========================
+      - id: block-windows-path
+        name: Block local path
+        entry: python GitSecurityTool/GitSecurityTool/block_secret.py
+        language: system
+        args: ["--mode", "windows_path"]
+
+  # =========================
+  # ■ ログ集約・重複排除
+  # =========================
+      - id: block-log-aggregator
+        name: Block log aggregator
+        entry: python GitSecurityTool/GitSecurityTool/block_secret.py
+        language: system
+        args: ["--mode", "log_aggregator"]

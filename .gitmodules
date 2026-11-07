@@ -1,0 +1,3 @@
+[submodule "GitSecurityTool"]
+	path = GitSecurityTool
+	url = https://github.com/tamina0624-study/GitSecurityTool.git
