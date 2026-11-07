@@ -14,6 +14,7 @@ from dvd_player.core import read_manifest
 from dvd_player.extraction import (
     ExtractionCancelled, bitmap_bounds, dvd_input, find_tool,
     frames_to_manifest, render_command, run_tool, DvdSubtitleExtractor,
+    checked_identity, probe_media,
 )
 from dvd_player.storage import CacheStore
 
@@ -71,7 +72,7 @@ class ExtractionTests(unittest.TestCase):
 
     def test_replaced_disc_is_rejected_before_extraction(self):
         with patch("dvd_player.extraction.find_tool", return_value="ffmpeg"), \
-                patch("dvd_player.extraction.media_identity", return_value="other"), \
+                patch("dvd_player.extraction.checked_identity", return_value="other"), \
                 patch("dvd_player.extraction.run_tool") as runner:
             with self.assertRaises(ValueError):
                 DvdSubtitleExtractor(CacheStore(self.root / "cache")).extract(
@@ -83,21 +84,22 @@ class ExtractionTests(unittest.TestCase):
             dict(index=2, codec_type="subtitle", codec_name="dvd_subtitle", tags=dict(language="eng")),
             dict(index=3, codec_type="subtitle", codec_name="dvd_subtitle", tags=dict(language="jpn")),
             dict(index=4, codec_type="subtitle", codec_name="dvd_subtitle", tags=dict(language="und"))])
-        def fake_run(args, cancel, timeout=900, image_directory=None):
+        def fake_run(args, cancel, timeout=900, image_directory=None, on_poll=None):
             if "-demuxers" in args:
                 return b" D dvdvideo"
             if "-show_streams" in args:
                 return json.dumps(metadata).encode()
-            image = QImage(2, 2, QImage.Format.Format_RGBA8888)
-            image.fill(QColor("white"))
-            image.save(str(image_directory / "000000001000.png"))
-            image.fill(QColor(0, 0, 0, 0))
-            image.save(str(image_directory / "000000002000.png"))
+            for directory in image_directory.iterdir():
+                image = QImage(2, 2, QImage.Format.Format_RGBA8888)
+                image.fill(QColor("white"))
+                image.save(str(directory / "000000001000.png"))
+                image.fill(QColor(0, 0, 0, 0))
+                image.save(str(directory / "000000002000.png"))
             return b""
         cache = CacheStore(self.root / "cache")
         notifications = []
         with patch("dvd_player.extraction.find_tool", side_effect=lambda name: name), \
-                patch("dvd_player.extraction.media_identity", return_value="media"), \
+                patch("dvd_player.extraction.checked_identity", return_value="media"), \
                 patch("dvd_player.extraction.run_tool", side_effect=fake_run):
             tracks, unknown = DvdSubtitleExtractor(cache).extract("D:/", "media", 0, self.cancel,
                                                                 lambda *args: notifications.append(args))
@@ -105,6 +107,34 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(unknown, [4])
         self.assertEqual(len(cache.load_tracks("media", 0)), 2)
         self.assertEqual(len([n for n in notifications if n[0] == "track"]), 2)
+
+    def test_partial_manifest_excludes_unfinished_cue(self):
+        self.frame(0, False)
+        self.frame(1000)
+        self.frame(1500)
+        self.frame(2000, False)
+        self.frame(3000)
+        self.frame(3500, False)
+        manifest = frames_to_manifest(self.root, "media", 0, "en", "4", 5000,
+                                      self.cancel, complete=False)
+        index, _ = read_manifest(manifest, "media", 0)
+        self.assertFalse(index.complete)
+        self.assertEqual([(c.start_ms, c.end_ms) for c in index.cues], [(1000, 2000)])
+        self.assertTrue(index.covers(1500))
+        self.assertFalse(index.covers(3000))
+
+    def test_identity_helper_output_is_validated(self):
+        with patch("dvd_player.extraction.run_tool", return_value=b""):
+            with self.assertRaises(ValueError):
+                checked_identity("D:/", self.cancel)
+
+    def test_media_presence_probe_runs_outside_gui_process(self):
+        video = self.root / "VIDEO_TS"
+        video.mkdir()
+        (video / "VIDEO_TS.IFO").write_bytes(b"navigation")
+        self.assertTrue(probe_media(str(self.root), self.cancel))
+        (video / "VIDEO_TS.IFO").unlink()
+        self.assertFalse(probe_media(str(self.root), self.cancel))
 
     @unittest.skipUnless(importlib.util.find_spec("av"), "optional PyAV test fixture generator not installed")
     def test_real_ffmpeg_decodes_synthetic_dvd_bitmap(self):

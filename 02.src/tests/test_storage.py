@@ -74,6 +74,40 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.cache.load_tracks("dvd", 0), [])
         self.assertEqual(len(self.cache.load_tracks("dvd", 1)), 1)
 
+    def test_snapshot_updates_same_track_and_preserves_later_coverage(self):
+        self.data.update(track_id="4", complete=False, coverage=[dict(start_ms=0, end_ms=2000)])
+        self.manifest.write_text(json.dumps(self.data), encoding="utf-8")
+        first = self.cache.save_snapshot(self.manifest, "dvd", 0)
+        self.data["coverage"][0]["end_ms"] = 3000
+        self.manifest.write_text(json.dumps(self.data), encoding="utf-8")
+        second = self.cache.save_snapshot(self.manifest, "dvd", 0)
+        self.assertEqual(first.track_id, second.track_id)
+        self.assertEqual(len(self.cache.load_tracks("dvd", 0)), 1)
+        self.data["coverage"][0]["end_ms"] = 1500
+        self.manifest.write_text(json.dumps(self.data), encoding="utf-8")
+        restored = self.cache.save_snapshot(self.manifest, "dvd", 0)
+        self.assertTrue(restored.index.covers(2500))
+        self.data["complete"] = True
+        self.manifest.write_text(json.dumps(self.data), encoding="utf-8")
+        completed = self.cache.save_snapshot(self.manifest, "dvd", 0)
+        self.assertTrue(completed.index.complete)
+
+    def test_language_assignment_persists_and_validates(self):
+        self.cache.save_language_map("dvd", 0, {4: "en", 5: "ja"})
+        self.assertEqual(self.cache.language_map("dvd", 0), {4: "en", 5: "ja"})
+        with self.assertRaises(ValueError):
+            self.cache.save_language_map("dvd", 0, {-1: "en"})
+
+    def test_title_directory_uses_safe_dvd_name_and_unique_disc_identity(self):
+        self.cache.set_media_name("dvd", "My: DVD/Title")
+        title_dir = self.cache.title_dir("dvd", 1)
+        self.assertIn("My_ DVD_Title", str(title_dir))
+        self.assertTrue(title_dir.is_relative_to(self.cache.root))
+        self.assertEqual(title_dir.parents[1].name, self.cache.media_names["dvd"])
+        other_title_dir = self.cache.title_dir("another-disc", 1)
+        self.assertNotEqual(title_dir.parent, other_title_dir.parent)
+        self.assertTrue(other_title_dir.is_relative_to(self.cache.root))
+
 
 if __name__ == "__main__":
     unittest.main()

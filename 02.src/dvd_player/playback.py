@@ -12,6 +12,19 @@ def dvd_drives() -> list[str]:
             if ctypes.windll.kernel32.GetDriveTypeW(f"{chr(n)}:\\") == 5]
 
 
+def dvd_name(source: str) -> str:
+    if os.name == "nt" and len(source) >= 2 and source[1] == ":":
+        root = source[:2] + "\\"
+        label = ctypes.create_unicode_buffer(261)
+        if ctypes.windll.kernel32.GetVolumeInformationW(root, label, len(label),
+                                                        None, None, None, None, 0) and label.value:
+            return label.value
+    directory = Path(source)
+    if directory.name.upper() == "VIDEO_TS":
+        directory = directory.parent
+    return directory.name or "DVD"
+
+
 def media_identity(drive: str) -> str:
     """Hash DVD navigation files; fail closed rather than reuse a wrong cache."""
     root = Path(drive) / "VIDEO_TS"
@@ -59,8 +72,8 @@ class Player:
         self.player.stop()
         if self.media:
             self.media.release()
-        location = drive.replace("\\", "/").rstrip("/")
-        self.media = self.instance.media_new(f"dvd:///{location}/#{title + 1}")
+        location = Path(drive).resolve().as_uri().replace("file:", "dvd:", 1).rstrip("/")
+        self.media = self.instance.media_new(f"{location}/#{title + 1}")
         self.player.set_media(self.media)
         if self.player.play() == -1:
             raise RuntimeError("DVDの再生を開始できませんでした。")

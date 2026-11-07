@@ -6,12 +6,12 @@ import re
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 
 from PySide6.QtGui import QImage
-from dvd_player.playback import media_identity
 
 
 class ExtractionCancelled(Exception):
@@ -33,7 +33,7 @@ def find_tool(name: str) -> str:
 
 
 def run_tool(args: list[str], cancel: threading.Event, timeout: int = 900,
-             image_directory: Path | None = None) -> bytes:
+             image_directory: Path | None = None, on_poll=None) -> bytes:
     """No shell, bounded output, cancellable child process, no leaked DVD paths in logs."""
     with tempfile.TemporaryFile() as output:
         process = subprocess.Popen(args, stdout=output, stderr=subprocess.DEVNULL,
@@ -50,9 +50,11 @@ def run_tool(args: list[str], cancel: threading.Event, timeout: int = 900,
                     raise ValueError("外部ツールの出力が大きすぎます。")
                 if image_directory is not None and time.monotonic() - checked > 1:
                     checked = time.monotonic()
-                    files = list(image_directory.glob("*.png"))
+                    files = list(image_directory.rglob("*.png"))
                     if len(files) > 100000 or sum(p.stat().st_size for p in files) > 512 * 1024 * 1024:
                         raise ValueError("抽出画像が容量上限を超えました。")
+                if on_poll is not None:
+                    on_poll()
             if cancel.is_set():
                 raise ExtractionCancelled()
             if process.returncode:
@@ -78,12 +80,36 @@ def dvd_input(source: str, title_id: int) -> list[str]:
     return ["-f", "dvdvideo", "-title", str(title_id + 1), "-trim", "0", "-i", source]
 
 
+def checked_identity(source, cancel):
+    value = run_tool([sys.executable, "-m", "dvd_player.probe", "identity", source], cancel, 20).decode().strip()
+    if not re.fullmatch(r"[a-f0-9]{64}", value):
+        raise ValueError("DVD管理情報の読み取り結果が不正です。")
+    return value
+
+
+def probe_media(source, cancel):
+    return run_tool([sys.executable, "-m", "dvd_player.probe", "present", source], cancel, 5).strip() == b"1"
+
+
 def render_command(ffmpeg: str, inputs: list[str], stream_index: int, directory: Path):
     return [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
             "-copyts", "-start_at_zero", *inputs,
             "-filter_complex", f"[0:{int(stream_index)}]null[subs]", "-map", "[subs]",
             "-c:v", "png", "-pix_fmt", "rgba", "-fps_mode", "passthrough",
             "-enc_time_base", "1:1000", "-frame_pts", "1", str(directory / "%012d.png")]
+
+
+def render_tracks_command(ffmpeg, inputs, streams, root):
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+               "-copyts", "-start_at_zero", *inputs, "-filter_complex",
+               ";".join(f"[0:{s['index']}]null[sub{s['index']}]" for s in streams)]
+    for stream in streams:
+        directory = root / str(stream["index"])
+        directory.mkdir()
+        command.extend(["-map", f"[sub{stream['index']}]", "-c:v", "png", "-threads:v", "1", "-pix_fmt", "rgba",
+                        "-fps_mode", "passthrough", "-enc_time_base", "1:1000", "-frame_pts", "1",
+                        str(directory / "%012d.png")])
+    return command
 
 
 def bitmap_bounds(image: QImage):
@@ -107,10 +133,12 @@ def bitmap_bounds(image: QImage):
 
 
 def frames_to_manifest(directory: Path, media_id: str, title_id: int, language: str,
-                       track_id: str, duration_ms: int | None, cancel: threading.Event) -> Path:
+                       track_id: str, duration_ms: int | None, cancel: threading.Event, *, complete=True) -> Path:
     """Transparent frames end a cue; repeated identical images do not create new cues."""
     files = sorted((p for p in directory.glob("*.png") if p.stem.lstrip("-").isdigit()),
                    key=lambda path: int(path.stem))
+    if not complete:
+        files = files[:-2]  # The newest files may still be written by the PNG encoder.
     cues = []
     current = None
     previous_time = -1
@@ -138,10 +166,12 @@ def frames_to_manifest(directory: Path, media_id: str, title_id: int, language: 
             current = None
         if cropped is not None:
             target = f"cue-{len(cues):06}.png"
-            if not cropped.save(str(directory / target)):
+            temporary = directory / (target + ".pending.png")
+            if not cropped.save(str(temporary)):
                 raise OSError("字幕画像を保存できません。")
+            temporary.replace(directory / target)
             current = dict(start_ms=position, image_path=target, digest=digest)
-    if current:
+    if current and complete:
         if duration_ms is None or duration_ms <= current["start_ms"]:
             raise ValueError("最後の字幕の終了時刻を確認できません。")
         cues.append(dict(cue_id=f"cue-{len(cues):06}", start_ms=current["start_ms"],
@@ -149,7 +179,11 @@ def frames_to_manifest(directory: Path, media_id: str, title_id: int, language: 
     if len(cues) > 100000:
         raise ValueError("字幕の件数が上限を超えました。")
     data = dict(schema_version=1, media_id=media_id, title_id=title_id, language=language,
-                track_id=track_id, complete=True, cues=cues)
+                track_id=track_id, complete=complete, cues=cues)
+    if not complete:
+        if previous_time <= 0:
+            raise ValueError("字幕の取得済み範囲がまだありません。")
+        data["coverage"] = [dict(start_ms=0, end_ms=previous_time)]
     manifest = directory / "manifest.json"
     manifest.write_text(json.dumps(data), encoding="utf-8")
     return manifest
@@ -159,11 +193,12 @@ class DvdSubtitleExtractor:
     def __init__(self, cache):
         self.cache = cache
 
-    def extract(self, source: str, media_id: str, title_id: int, cancel: threading.Event, notify):
+    def extract(self, source: str, media_id: str, title_id: int, cancel: threading.Event, notify,
+                language_overrides=None):
         ffmpeg, ffprobe = find_tool("ffmpeg"), find_tool("ffprobe")
         if cancel.is_set():
             raise ExtractionCancelled()
-        if media_identity(source) != media_id:
+        if checked_identity(source, cancel) != media_id:
             raise ValueError("DVDが変更されています。読み込み直してください。")
         formats = run_tool([ffmpeg, "-hide_banner", "-demuxers"], cancel, 20).decode(errors="replace")
         if "dvdvideo" not in formats:
@@ -176,29 +211,55 @@ class DvdSubtitleExtractor:
         duration_ms = round(float(duration) * 1000) if duration is not None else None
         results = []
         unknown = []
+        selected = []
         for stream in streams:
             code = stream.get("tags", {}).get("language", "und").lower()
             language = {"eng": "en", "en": "en", "jpn": "ja", "ja": "ja"}.get(code)
+            language = (language_overrides or {}).get(stream["index"], language)
             if language is None:
                 unknown.append(stream["index"])
                 continue
             if stream.get("codec_name") != "dvd_subtitle":
                 continue
-            if cancel.is_set():
-                raise ExtractionCancelled()
-            notify("progress", f"{'英語' if language == 'en' else '日本語'}字幕を取得中…")
-            with tempfile.TemporaryDirectory(prefix="dvd-subtitles-") as temp:
-                directory = Path(temp)
-                command = render_command(ffmpeg, dvd_input(source, title_id), stream["index"], directory)
-                run_tool(command, cancel, image_directory=directory)
-                if media_identity(source) != media_id:
-                    raise ValueError("取得中にDVDが変更されました。読み込み直してください。")
-                manifest = frames_to_manifest(directory, media_id, title_id, language,
-                                               str(stream["index"]), duration_ms, cancel)
-                track, warning = self.cache.import_manifest(manifest, media_id, title_id)
-                if warning:
-                    # The temporary directory cannot be used after this worker finishes.
-                    raise ValueError("抽出字幕を保存できません。空き容量・保存先を確認してください。")
+            stream["language"] = language
+            selected.append(stream)
+        notify("unknown", unknown)
+        if not selected:
+            return [], unknown
+        with tempfile.TemporaryDirectory(prefix="dvd-subtitles-") as temp:
+            root = Path(temp)
+            command = render_tracks_command(ffmpeg, dvd_input(source, title_id), selected, root)
+            last_preview = 0
+            previous_counts = {}
+            def preview():
+                nonlocal last_preview
+                if time.monotonic() - last_preview < 5:
+                    return
+                last_preview = time.monotonic()
+                positions = []
+                for stream in selected:
+                    directory = root / str(stream["index"])
+                    count = sum(1 for p in directory.glob("*.png") if p.stem.isdigit())
+                    if count < 4 or count == previous_counts.get(stream["index"]):
+                        continue
+                    manifest = frames_to_manifest(directory, media_id, title_id, stream["language"],
+                                                  str(stream["index"]), duration_ms, cancel, complete=False)
+                    track = self.cache.save_snapshot(manifest, media_id, title_id)
+                    notify("track", track)
+                    previous_counts[stream["index"]] = count
+                    positions.extend(end for _, end in track.index.coverage)
+                if positions:
+                    seconds = max(positions) // 1000
+                    notify("progress", f"字幕取得中：{seconds // 60:02}:{seconds % 60:02}付近まで確認済み（途中の字幕も表示できます）")
+            notify("progress", f"{len(selected)}トラックの字幕をまとめて取得中…")
+            read_timeout = min(7200, max(900, (duration_ms or 0) // 500))
+            run_tool(command, cancel, timeout=read_timeout, image_directory=root, on_poll=preview)
+            if checked_identity(source, cancel) != media_id:
+                raise ValueError("取得中にDVDが変更されました。読み込み直してください。")
+            for stream in selected:
+                manifest = frames_to_manifest(root / str(stream["index"]), media_id, title_id,
+                                              stream["language"], str(stream["index"]), duration_ms, cancel)
+                track = self.cache.save_snapshot(manifest, media_id, title_id)
                 results.append(track)
                 notify("track", track)
         return results, unknown

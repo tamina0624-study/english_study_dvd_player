@@ -20,11 +20,14 @@ class Cue:
     cue_id: str
     start_ms: int
     end_ms: int
-    image: Path
+    image: Path | None = None
+    text: str | None = None
 
 
 class CueIndex:
-    def __init__(self, cues=()):
+    def __init__(self, cues=(), *, complete=True, coverage=()):
+        self.complete = complete
+        self.coverage = tuple(coverage)
         self.cues = sorted(cues, key=lambda c: (c.start_ms, c.end_ms, c.cue_id))
         self.starts = [c.start_ms for c in self.cues]
         self.max_ends = []
@@ -32,6 +35,9 @@ class CueIndex:
         for cue in self.cues:
             end = max(end, cue.end_ms)
             self.max_ends.append(end)
+
+    def covers(self, ms):
+        return self.complete or any(start <= ms < end for start, end in self.coverage)
 
     def active(self, ms: int) -> list[int]:
         i = bisect_right(self.starts, ms) - 1
@@ -92,8 +98,19 @@ def read_manifest(path: Path, media_id: str, title_id: int) -> tuple[CueIndex, s
     language = data.get("language")
     if language not in ("en", "ja"):
         raise ValueError("字幕の言語はenまたはjaを指定してください。")
-    if data.get("complete") is not True:
-        raise ValueError("この版では取得完了済みの字幕データのみ読み込めます。")
+    complete = data.get("complete")
+    if type(complete) is not bool:
+        raise ValueError("字幕の取得状態が不正です。")
+    coverage = []
+    for interval in data.get("coverage", []):
+        if not isinstance(interval, dict):
+            raise ValueError("取得済み範囲が不正です。")
+        start, end = interval.get("start_ms"), interval.get("end_ms")
+        if type(start) is not int or type(end) is not int or not 0 <= start < end:
+            raise ValueError("取得済み範囲が不正です。")
+        coverage.append((start, end))
+    if not complete and not coverage:
+        raise ValueError("途中取得の字幕には取得済み範囲が必要です。")
     rows = data.get("cues")
     if not isinstance(rows, list) or len(rows) > 100000:
         raise ValueError("字幕の件数が不正です。")
@@ -107,6 +124,13 @@ def read_manifest(path: Path, media_id: str, title_id: int) -> tuple[CueIndex, s
             raise ValueError("字幕IDが不正または重複しています。")
         if type(start) is not int or type(end) is not int or not 0 <= start < end:
             raise ValueError("字幕の時刻が不正です。")
+        if "text" in row:
+            text = row["text"]
+            if not isinstance(text, str) or not text.strip() or len(text) > 10000:
+                raise ValueError("字幕の文字データが不正です。")
+            ids.add(key)
+            cues.append(Cue(key, start, end, text=text))
+            continue
         relative = row.get("image_path")
         if not isinstance(relative, str) or Path(relative).is_absolute():
             raise ValueError("字幕画像のパスが不正です。")
@@ -115,4 +139,7 @@ def read_manifest(path: Path, media_id: str, title_id: int) -> tuple[CueIndex, s
             raise ValueError("字幕画像が見つからないか、保存範囲外です。")
         ids.add(key)
         cues.append(Cue(key, start, end, image))
-    return CueIndex(cues), language
+    if not complete and any(not any(start <= cue.start_ms and cue.end_ms <= end
+                                   for start, end in coverage) for cue in cues):
+        raise ValueError("字幕が取得済み範囲から外れています。")
+    return CueIndex(cues, complete=complete, coverage=coverage), language

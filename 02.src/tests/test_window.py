@@ -4,12 +4,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pathlib import Path
 import tempfile
 import logging
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-from PySide6.QtGui import QImage
-from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QImage, QPainter, QColor
+from PySide6.QtCore import QCoreApplication, QEvent, QRect
+from PySide6.QtWidgets import QApplication, QAbstractSlider, QStyleOptionViewItem
 
 from dvd_player.core import Cue, CueIndex
 from dvd_player.window import MainWindow
@@ -50,26 +51,84 @@ class WindowTests(unittest.TestCase):
         self.assertFalse(self.window.play_button.isEnabled())
         self.assertIn("VLC", self.window.statusBar().currentMessage())
 
-    def test_image_subtitle_and_language_switch(self):
+    def test_current_subtitle_highlight_is_painted_for_images_and_text(self):
+        for cue in (Cue("image", 1000, 3000, Path("unused.png")),
+                    Cue("text", 1000, 3000, text="Example")):
+            with self.subTest(text=cue.text):
+                self.window._apply_subtitles((CueIndex([cue]), "en"))
+                listing = self.window.subtitle_list
+                option = QStyleOptionViewItem()
+                option.rect = QRect(0, 0, 400, 100)
+                for ms, expected in ((1500, "#75dcc7"), (4000, "#1b2839")):
+                    self.window._sync(ms)
+                    canvas = QImage(400, 100, QImage.Format.Format_RGB32)
+                    canvas.fill(QColor("black"))
+                    painter = QPainter(canvas)
+                    listing.itemDelegate().paint(painter, option, listing.model().index(0, 0))
+                    painter.end()
+                    self.assertEqual(canvas.pixelColor(6, 45).name(), expected)
+
+    def test_follow_resume_scrolls_to_current_subtitle(self):
+        cues = [Cue(str(i), i * 2000, i * 2000 + 1500, text=f"Subtitle {i}")
+                for i in range(30)]
+        self.window._apply_subtitles((CueIndex(cues), "en"))
+        self.window.show()
+        self.app.processEvents()
+        self.window._manual_scroll()
+        self.window._sync(50000)
+        self.assertFalse(self.window.follow_button.isChecked())
+        self.window.subtitle_list.verticalScrollBar().setValue(0)
+        self.window.follow_button.click()
+        self.assertTrue(self.window.follow)
+        self.assertTrue(self.window.follow_button.isChecked())
+        rect = self.window.subtitle_list.visualItemRect(self.window.subtitle_list.item(25))
+        self.assertTrue(self.window.subtitle_list.viewport().rect().intersects(rect))
+
+    def test_english_and_japanese_subtitles_share_one_wide_list(self):
         with tempfile.TemporaryDirectory() as temp:
             image = QImage(160, 50, QImage.Format.Format_RGB32)
             image.fill(0xFFFFFF)
             path = Path(temp) / "subtitle.png"
             self.assertTrue(image.save(str(path)))
-            index = CueIndex([Cue("a", 1000, 3000, path)])
-            self.window._apply_subtitles((index, "en"))
+            english_cues = [Cue(f"en-{i}", 1000 + i * 6000, 3000 + i * 6000, path)
+                            for i in range(3)]
+            self.window._apply_subtitles((CueIndex(english_cues), "en"))
+            self.window._apply_subtitles((CueIndex([Cue("ja", 1000, 3000, text="日本語")]), "ja"))
             self.window.show()
             self.app.processEvents()
             self.window._sync(1500)
-            self.assertEqual(self.window.active_rows, ("en", (0,)))
-            self.assertFalse(self.window.lists["en"].item(0).icon().isNull())
-            self.window.tabs.setCurrentIndex(1)
-            self.window._sync(1500)
-            self.assertEqual(self.window.active_rows, ("ja", ()))
-            self.window.tabs.setCurrentIndex(0)
+            self.assertEqual(self.window.active_rows, {"en": (0,), "ja": (0,)})
+            listing = self.window.subtitle_list
+            self.assertEqual(listing.count(), 4)
+            self.assertFalse(listing.item(0).icon().isNull())
+            self.assertIn("日本語", listing.item(1).text())
+            self.assertTrue(listing.isVisible())
+            self.assertGreater(listing.height(), 400)
+            self.assertGreater(listing.width(), 450)
+            self.assertFalse(hasattr(self.window, "track_selectors"))
+            self.assertFalse(hasattr(self.window, "subtitle_groups"))
+            self.assertFalse(hasattr(self.window, "operation_language"))
+            for button in (self.window.import_button, self.window.extract_button,
+                           self.window.ocr_button, self.window.edit_button,
+                           self.window.cancel_extract_button, self.window.assign_language_button,
+                           self.window.follow_button):
+                self.assertEqual(button.text(), "")
+                self.assertFalse(button.icon().isNull())
+                self.assertTrue(button.toolTip())
+                self.assertEqual(button.size().width(), 30)
+            self.assertLessEqual(listing.iconSize().height(), 64)
+            image_rows_height = sum(listing.item(i).sizeHint().height()
+                                    for i in (0, 2, 3))
+            self.assertLessEqual(image_rows_height, listing.viewport().height())
+            self.assertGreaterEqual(listing.item(1).font().pointSizeF(), 20)
+            self.window._select_subtitle_item(listing.item(1))
+            self.assertEqual(self.window.active_language, "ja")
             self.window._sync(4000)
             self.assertEqual(self.window.highlight_rows["en"], set())
-            self.assertEqual(self.window.lists["en"].item(0).background().color().alpha(), 0)
+            self.assertEqual(listing.item(0).background().color().alpha(), 0)
+            self.assertLessEqual(
+                abs(self.window.import_button.geometry().center().y()
+                    - self.window.volume.geometry().center().y()), 10)
 
     def test_rewind_requests_two_seconds_and_restores_pause(self):
         self.window.engine = MagicMock()
@@ -94,8 +153,9 @@ class WindowTests(unittest.TestCase):
         self.window._add_cached_track(CachedTrack("one", "en", first))
         self.window._add_cached_track(CachedTrack("two", "en", second), select=False)
         self.assertIs(self.window.indexes["en"], first)
-        self.window._select_track("en", 1)
+        self.window.track_menus["en"].actions()[1].trigger()
         self.assertIs(self.window.indexes["en"], second)
+        self.assertEqual(self.window.track_menus["en"].actions()[1].text(), "画像トラック 2")
         self.window.engine.player.set_time.assert_not_called()
 
     def test_cancel_rejects_queued_extraction_results(self):
@@ -105,6 +165,98 @@ class WindowTests(unittest.TestCase):
         self.window._tick()
         self.assertNotIn("古い進捗", self.window.subtitle_status.text())
         self.assertTrue(self.window.extraction_cancel.is_set())
+
+    def test_unknown_track_language_can_be_assigned_and_saved(self):
+        self.window.unknown_tracks = [9]
+        self.window.media_id = "test"
+        with patch("dvd_player.window.QInputDialog.getItem", return_value=("英語", True)), \
+                patch.object(self.window, "_start_extraction") as restart:
+            self.window._assign_language()
+        self.assertEqual(self.window.cache.language_map("test", 0), {9: "en"})
+        restart.assert_called_once()
+
+    def test_media_removal_resets_playback_and_cancels_io(self):
+        self.window.engine = MagicMock()
+        self.window.ready = True
+        self.window.media_id = "test"
+        self.window._media_removed()
+        self.assertFalse(self.window.ready)
+        self.assertTrue(self.window.media_cancel.is_set())
+        self.assertFalse(self.window.play_button.isEnabled())
+        self.window.engine.player.stop.assert_called_once()
+
+    def test_partial_subtitles_do_not_show_stale_cue_outside_coverage(self):
+        self.window._display_track(CueIndex([], complete=False, coverage=[(0, 2000)]), "en")
+        self.window._sync(3000)
+        self.assertIn("未取得", self.window.coverage_status.text())
+        self.window._sync(1000)
+        self.assertEqual(self.window.coverage_status.text(), "")
+
+    def test_chapter_change_uses_start_time_and_preserves_pause(self):
+        self.window.engine = MagicMock()
+        self.window.ready = True
+        p = self.window.engine.player
+        p.get_chapter.return_value = 0
+        p.get_chapter_count.return_value = 2
+        p.is_seekable.return_value = True
+        p.is_playing.return_value = False
+        p.get_full_chapter_descriptions.return_value = [SimpleNamespace(time_offset=0),
+                                                       SimpleNamespace(time_offset=1332000)]
+        self.window._chapter(1)
+        self.assertEqual(self.window.seek.target, 1332000)
+        self.assertFalse(self.window.seek.resume)
+
+    def test_complete_empty_track_has_explicit_message(self):
+        self.window._display_track(CueIndex(), "ja")
+        self.assertIn("字幕がありません", self.window.subtitle_status.text())
+
+    def test_keyboard_seek_and_title_restart_clear_old_request(self):
+        self.window.engine = MagicMock()
+        self.window.ready = True
+        p = self.window.engine.player
+        p.is_seekable.return_value = True
+        p.is_playing.return_value = False
+        p.get_length.return_value = 30000
+        self.window.slider.triggerAction(QAbstractSlider.SliderAction.SliderToMaximum)
+        self.app.processEvents()
+        self.assertEqual(self.window.seek.target, 30000)
+        self.window._start_title()
+        self.assertIsNone(self.window.seek.target)
+
+    def test_text_subtitles_render_and_sync_without_images(self):
+        self.window._display_track(CueIndex([Cue("text", 1000, 3000, text="Hello\n日本語")]), "en")
+        self.window.show()
+        self.app.processEvents()
+        self.window._sync(2000)
+        item = self.window.subtitle_list.item(0)
+        self.assertIn("Hello\n日本語", item.text())
+        self.assertTrue(item.icon().isNull())
+        self.assertEqual(self.window.active_rows["en"], (0,))
+
+    def test_editor_button_exports_then_launches_editor(self):
+        executable = Path(self.temp.name) / "SubtitleEdit.exe"
+        executable.write_bytes(b"test-only")
+        self.window.editor_path = executable
+        self.window.media_id = "test"
+        self.window.indexes["en"] = CueIndex([Cue("1", 1000, 2000, text="Editable text")])
+        with patch("dvd_player.window.QFileDialog.getExistingDirectory", return_value=self.temp.name):
+            self.window._open_editor()
+        self.window.jobs[-1][2].result(timeout=5)
+        with patch("dvd_player.window.launch_editor") as launch:
+            self.window._tick()
+        exported = launch.call_args.args[1]
+        self.assertTrue(exported.is_file())
+        self.assertEqual(exported.suffix, ".srt")
+        self.assertEqual(self.window.srt_sources[("test", 0, "en")], exported)
+
+    def test_background_srt_import_updates_text_without_playback(self):
+        source = Path(self.temp.name) / "sample.srt"
+        source.write_text("1\n00:00:01,000 --> 00:00:02,000\nImported text\n", encoding="utf-8")
+        self.window.media_id = "test"
+        self.window._queue_srt(source, "en")
+        self.window.jobs[-1][2].result(timeout=5)
+        self.window._tick()
+        self.assertEqual(self.window.indexes["en"].cues[0].text, "Imported text")
 
 
 if __name__ == "__main__":

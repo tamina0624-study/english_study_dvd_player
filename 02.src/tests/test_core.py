@@ -113,6 +113,16 @@ class ManifestTests(unittest.TestCase):
         (self.root / "disc2" / "VIDEO_TS" / "VIDEO_TS.IFO").write_bytes(b"different")
         self.assertNotEqual(first, media_identity(str(self.root / "disc2")))
 
+    def test_partial_manifest_requires_coverage_for_every_cue(self):
+        self.data.update(complete=False, coverage=[dict(start_ms=0, end_ms=1500)])
+        index, _ = self.load()
+        self.assertFalse(index.complete)
+        self.assertTrue(index.covers(1499))
+        self.assertFalse(index.covers(1500))
+        self.data["coverage"][0]["end_ms"] = 500
+        with self.assertRaises(ValueError):
+            self.load()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,5 +14,8 @@ build/
 !/03.log/
 *.egg-info/
 /cache/
+/subtittle/
 /.tmp/
 /.tools/
+dvd-subtitles-*/
+*.srt
