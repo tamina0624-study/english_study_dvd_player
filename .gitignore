@@ -12,3 +12,6 @@ build/
 
 /GitSecurityTool/GitSecurityTool/.secret_detected.log
 !/03.log/
+*.egg-info/
+/cache/
+/.tmp/
