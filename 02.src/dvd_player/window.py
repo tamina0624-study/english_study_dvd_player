@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import time
+import queue
+import threading
 
 from PySide6.QtCore import Qt, QTimer, QSize
 from PySide6.QtGui import QColor, QImageReader, QIcon, QPixmap
@@ -10,8 +12,10 @@ from PySide6.QtWidgets import (
     QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from dvd_player.core import CueIndex, SeekCoordinator, read_manifest, timestamp
+from dvd_player.core import CueIndex, SeekCoordinator, timestamp
 from dvd_player.playback import Player, dvd_drives, media_identity
+from dvd_player.storage import CacheStore, app_data_dir, setup_logging
+from dvd_player.extraction import DvdSubtitleExtractor, ExtractionCancelled
 
 
 class MainWindow(QMainWindow):
@@ -25,8 +29,15 @@ class MainWindow(QMainWindow):
         self.preparing = False
         self.ready = False
         self.media_id = ""
+        self.loaded_drive = ""
         self.title_id = 0
         self.generation = 0
+        self.cache = CacheStore(app_data_dir() / "cache")
+        self.logger = setup_logging(app_data_dir())
+        self.cache_loaded = None
+        self.extraction_cancel = threading.Event()
+        self.extracting = False
+        self.extraction_events = queue.SimpleQueue()
         self.seek = SeekCoordinator()
         self.indexes = {"en": CueIndex(), "ja": CueIndex()}
         self.follow = True
@@ -74,7 +85,15 @@ class MainWindow(QMainWindow):
         side_layout = QVBoxLayout(side)
         self.tabs = QTabWidget()
         self.lists = {}
+        self.track_selectors = {}
         for language, name in (("en", "英語"), ("ja", "日本語")):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            tracks = QComboBox()
+            tracks.setAccessibleName(name + "字幕トラック")
+            tracks.activated.connect(lambda i, lang=language: self._select_track(lang, i))
+            self.track_selectors[language] = tracks
+            page_layout.addWidget(tracks)
             listing = QListWidget()
             listing.setIconSize(QSize(290, 130))
             listing.setWordWrap(True)
@@ -82,7 +101,8 @@ class MainWindow(QMainWindow):
             listing.viewport().installEventFilter(self)
             listing.setAccessibleName(name + "字幕一覧")
             self.lists[language] = listing
-            self.tabs.addTab(listing, name)
+            page_layout.addWidget(listing)
+            self.tabs.addTab(page, name)
         self.tabs.currentChanged.connect(self._language_changed)
         side_layout.addWidget(self.tabs)
         self.subtitle_status = QLabel("DVDを開いてください。")
@@ -90,6 +110,10 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.subtitle_status)
         self.import_button = self._button("事前処理した字幕を読み込む", self._import_subtitles)
         side_layout.addWidget(self.import_button)
+        self.extract_button = self._button("DVD字幕を取得／再取得", self._start_extraction)
+        side_layout.addWidget(self.extract_button)
+        self.cancel_extract_button = self._button("字幕取得を中止", self._stop_extraction)
+        side_layout.addWidget(self.cancel_extract_button)
         side_layout.addWidget(self._button("現在の字幕へ", self._enable_follow))
         splitter.addWidget(side)
         splitter.setSizes([780, 380])
@@ -136,8 +160,10 @@ class MainWindow(QMainWindow):
     def _initialize(self):
         try:
             self.engine = Player(int(self.video.winId()))
-            self.statusBar().showMessage("DVDを選択して「DVDを開く」を押してください。")
+            self.statusBar().showMessage("DVDを選択して「DVDを開く」を押してください。" if self.drives.count()
+                                        else "VLCの準備ができました。DVDドライブを接続して再検索してください。")
         except Exception:
+            self.logger.warning("ENV_MISSING operation=initialize")
             self.statusBar().showMessage("VLCを利用できません。Pythonと同じビット数のVLCを導入し、再起動してください。")
         self._set_controls(False)
 
@@ -157,6 +183,8 @@ class MainWindow(QMainWindow):
         self.rewind.setEnabled(seekable)
         self.slider.setEnabled(seekable and self.engine.player.get_length() > 0)
         self.import_button.setEnabled(available and bool(self.media_id))
+        self.extract_button.setEnabled(available and bool(self.media_id) and not self.extracting)
+        self.cancel_extract_button.setEnabled(self.extracting)
         self.open_button.setEnabled(self.engine is not None and not self.preparing)
         chapter = self.engine.player.get_chapter() if available else -1
         count = self.engine.player.get_chapter_count() if available else 0
@@ -167,6 +195,9 @@ class MainWindow(QMainWindow):
         self.indexes = {"en": CueIndex(), "ja": CueIndex()}
         for listing in self.lists.values():
             listing.clear()
+        for selector in self.track_selectors.values():
+            selector.clear()
+        self.cache_loaded = None
         self.active_rows = None
         self.image_rows = {"en": set(), "ja": set()}
         self.highlight_rows = {"en": set(), "ja": set()}
@@ -176,6 +207,7 @@ class MainWindow(QMainWindow):
         if not self.engine or not self.drives.currentText():
             self._error("DVDドライブを選択してください。")
             return
+        self._cancel_extraction()
         self.generation += 1
         self.loaded = self.ready = False
         self.preparing = True
@@ -186,6 +218,7 @@ class MainWindow(QMainWindow):
         self._reset_subtitles()
         self.engine.player.stop()
         drive = self.drives.currentText()
+        self.loaded_drive = drive
         self.jobs.append(("identity", self.generation, self.executor.submit(media_identity, drive)))
         self.prepared_at = time.monotonic()
         self.statusBar().showMessage("DVD管理情報を読み込み中…")
@@ -193,7 +226,7 @@ class MainWindow(QMainWindow):
         self._set_controls(False)
 
     def _start_title(self):
-        self.engine.open(self.drives.currentText(), self.title_id)
+        self.engine.open(self.loaded_drive, self.title_id)
         self.engine.player.audio_set_volume(0)
         self.preparing = True
         self.prepared_at = time.monotonic()
@@ -202,6 +235,7 @@ class MainWindow(QMainWindow):
     def _select_title(self, index):
         if not self.engine or index < 0:
             return
+        self._cancel_extraction()
         self.generation += 1
         self.title_id = self.titles.itemData(index)
         self.seek.clear()
@@ -224,8 +258,13 @@ class MainWindow(QMainWindow):
         p.audio_set_volume(self.volume.value())
         self.preparing = False
         self.ready = self.loaded = True
-        self.subtitle_status.setText("DVD字幕の自動取得は未接続です。事前処理済み字幕（JSON＋画像）を読み込めます。")
+        self.subtitle_status.setText("保存済み字幕を確認しています…")
         self.statusBar().showMessage(f"再生待機 ／ タイトル {self.title_id + 1}")
+        cache_key = (self.media_id, self.title_id)
+        if self.media_id and self.cache_loaded != cache_key:
+            self.cache_loaded = cache_key
+            self.jobs.append(("cache", self.generation, self.executor.submit(
+                self.cache.load_tracks, self.media_id, self.title_id)))
 
     def _toggle_play(self):
         if not self.ready:
@@ -289,12 +328,56 @@ class MainWindow(QMainWindow):
     def _import_subtitles(self):
         filename, _ = QFileDialog.getOpenFileName(self, "字幕manifest.jsonを選択", "", "字幕情報 (*.json)")
         if filename:
-            job = self.executor.submit(read_manifest, Path(filename), self.media_id, self.title_id)
+            job = self.executor.submit(self.cache.import_manifest, Path(filename), self.media_id, self.title_id)
             self.jobs.append(("subtitles", self.generation, job))
             self.subtitle_status.setText("字幕データを読み込み中…")
 
     def _apply_subtitles(self, result):
         index, language = result
+        self._display_track(index, language)
+
+    def _cancel_extraction(self):
+        self.extraction_cancel.set()
+        self.extracting = False
+
+    def _stop_extraction(self):
+        self._cancel_extraction()
+        self.generation += 1
+        self.subtitle_status.setText("字幕取得を中止しました。取得済みの字幕は引き続き使用できます。")
+
+    def _start_extraction(self):
+        if not self.ready or not self.media_id or self.extracting:
+            return
+        self.extraction_cancel = threading.Event()
+        generation = self.generation
+        def notify(kind, payload):
+            self.extraction_events.put((generation, kind, payload))
+        future = self.executor.submit(DvdSubtitleExtractor(self.cache).extract,
+                                      self.loaded_drive, self.media_id, self.title_id,
+                                      self.extraction_cancel, notify)
+        self.jobs.append(("extract", generation, future))
+        self.extracting = True
+        self.subtitle_status.setText("DVD字幕を調べています…")
+
+    def _add_cached_track(self, track, select=True):
+        selector = self.track_selectors[track.language]
+        existing = next((i for i in range(selector.count())
+                         if selector.itemData(i)[0] == track.track_id), -1)
+        if existing < 0:
+            existing = selector.count()
+            selector.addItem(f"トラック {existing + 1}", (track.track_id, track.index))
+        else:
+            selector.setItemData(existing, (track.track_id, track.index))
+        if select or selector.currentIndex() == existing:
+            selector.setCurrentIndex(existing)
+            self._display_track(track.index, track.language)
+
+    def _select_track(self, language, number):
+        data = self.track_selectors[language].itemData(number)
+        if data:
+            self._display_track(data[1], language)
+
+    def _display_track(self, index, language):
         listing = self.lists[language]
         listing.clear()
         self.image_rows[language] = set()
@@ -356,6 +439,14 @@ class MainWindow(QMainWindow):
         self._load_visible_images(listing, index, language)
 
     def _tick(self):
+        while not self.extraction_events.empty():
+            generation, kind, payload = self.extraction_events.get()
+            if generation != self.generation:
+                continue
+            if kind == "track":
+                self._add_cached_track(payload, select=self.track_selectors[payload.language].count() == 0)
+            else:
+                self.subtitle_status.setText(payload)
         for kind, generation, job in list(self.jobs):
             if not job.done():
                 continue
@@ -367,9 +458,33 @@ class MainWindow(QMainWindow):
                 if kind == "identity":
                     self.media_id = result
                     self._start_title()
+                elif kind == "cache":
+                    for track in result:
+                        self._add_cached_track(track, select=self.track_selectors[track.language].count() == 0)
+                    if result:
+                        self.subtitle_status.setText("保存済み字幕を自動で読み込みました。")
+                    if {track.language for track in result} != {"en", "ja"}:
+                        self._start_extraction()
+                elif kind == "extract":
+                    self.extracting = False
+                    tracks, unknown = result
+                    for track in tracks:
+                        self._add_cached_track(track, select=self.track_selectors[track.language].count() == 0)
+                    self.subtitle_status.setText(f"字幕取得完了：{len(tracks)}トラック。" +
+                                                 (f"言語不明の{len(unknown)}トラックは未取得です。" if unknown else ""))
+                elif kind == "subtitles":
+                    track, warning = result
+                    self._add_cached_track(track)
+                    if warning:
+                        self.subtitle_status.setText("字幕を読み込みました。保存できないため、次回は再読込が必要です。")
                 else:
                     self._apply_subtitles(result)
             except Exception as error:
+                if kind == "extract":
+                    self.extracting = False
+                    if isinstance(error, ExtractionCancelled):
+                        continue
+                self.logger.warning("LOAD_FAILED operation=%s title=%s", kind, self.title_id)
                 if kind == "identity":
                     self.preparing = False
                     self._error("DVDを読み込めません。媒体とドライブを確認してください。")
@@ -424,6 +539,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     def _playback_failed(self):
+        self._cancel_extraction()
+        self.logger.warning("PLAYBACK_FAILED title=%s", self.title_id)
         self.generation += 1
         self.ready = self.loaded = self.preparing = False
         self.seek.clear()
@@ -434,6 +551,7 @@ class MainWindow(QMainWindow):
         self._error("DVD再生に失敗しました。媒体・リージョン・VLCを確認して再度読み込んでください。")
 
     def closeEvent(self, event):
+        self._cancel_extraction()
         self.generation += 1
         self.timer.stop()
         for _, _, job in self.jobs:

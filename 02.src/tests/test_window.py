@@ -3,6 +3,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from pathlib import Path
 import tempfile
+import logging
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import QApplication
 
 from dvd_player.core import Cue, CueIndex
 from dvd_player.window import MainWindow
+from dvd_player.storage import CachedTrack
 
 
 class WindowTests(unittest.TestCase):
@@ -20,6 +22,11 @@ class WindowTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.env_patch = patch.dict(os.environ, {"DVD_PLAYER_DATA_DIR": self.temp.name})
+        self.env_patch.start()
+        self.player_patch = patch("dvd_player.window.Player", side_effect=OSError("test environment"))
+        self.player_patch.start()
         self.window = MainWindow()
         self.window.timer.stop()
         self.app.processEvents()
@@ -29,6 +36,13 @@ class WindowTests(unittest.TestCase):
         self.window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
+        self.player_patch.stop()
+        self.env_patch.stop()
+        logger = logging.getLogger("dvd_player")
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+        self.temp.cleanup()
 
     def test_missing_vlc_does_not_crash(self):
         with patch("dvd_player.window.Player", side_effect=OSError("missing")):
@@ -72,6 +86,25 @@ class WindowTests(unittest.TestCase):
         p.get_time.return_value = 6000
         self.window._update_playback()
         self.window.engine.play.assert_not_called()
+
+    def test_cached_tracks_can_switch_without_changing_playback(self):
+        first = CueIndex([Cue("a", 0, 1000, Path("unused"))])
+        second = CueIndex([Cue("b", 2000, 3000, Path("unused"))])
+        self.window.engine = MagicMock()
+        self.window._add_cached_track(CachedTrack("one", "en", first))
+        self.window._add_cached_track(CachedTrack("two", "en", second), select=False)
+        self.assertIs(self.window.indexes["en"], first)
+        self.window._select_track("en", 1)
+        self.assertIs(self.window.indexes["en"], second)
+        self.window.engine.player.set_time.assert_not_called()
+
+    def test_cancel_rejects_queued_extraction_results(self):
+        generation = self.window.generation
+        self.window.extraction_events.put((generation, "progress", "古い進捗"))
+        self.window._stop_extraction()
+        self.window._tick()
+        self.assertNotIn("古い進捗", self.window.subtitle_status.text())
+        self.assertTrue(self.window.extraction_cancel.is_set())
 
 
 if __name__ == "__main__":

@@ -32,11 +32,16 @@ class Player:
         self._dll_handle = None
         if os.name == "nt":
             candidates = [os.environ.get("VLC_HOME", "")]
+            tools = Path(__file__).resolve().parents[2] / ".tools"
+            candidates += [str(path) for path in sorted(tools.glob("vlc-*"), reverse=True) if path.is_dir()]
             candidates += [str(Path(os.environ.get(name, "")) / "VideoLAN" / "VLC")
                            for name in ("ProgramFiles", "ProgramFiles(x86)")]
             for candidate in candidates:
                 if candidate and (Path(candidate) / "libvlc.dll").is_file():
                     self._dll_handle = os.add_dll_directory(candidate)
+                    ctypes.CDLL(str(Path(candidate) / "libvlc.dll"))
+                    os.environ.setdefault("PYTHON_VLC_LIB_PATH", str(Path(candidate) / "libvlc.dll"))
+                    os.environ.setdefault("PYTHON_VLC_MODULE_PATH", str(Path(candidate) / "plugins"))
                     os.environ.setdefault("VLC_PLUGIN_PATH", str(Path(candidate) / "plugins"))
                     break
         import vlc
