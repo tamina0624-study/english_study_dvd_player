@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -72,6 +73,8 @@ def dvd_input(source: str, title_id: int) -> list[str]:
     if type(title_id) is not int or title_id < 0:
         raise ValueError("タイトル番号が不正です。")
     # Keep initial padding cells so that time zero matches title playback.
+    if re.fullmatch(r"[A-Za-z]:[\\/]*", source):
+        source = source[:2]
     return ["-f", "dvdvideo", "-title", str(title_id + 1), "-trim", "0", "-i", source]
 
 

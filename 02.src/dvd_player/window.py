@@ -249,8 +249,8 @@ class MainWindow(QMainWindow):
     def _finish_preparing(self):
         p = self.engine.player
         if self.titles.count() == 0:
-            for i in range(max(1, p.get_title_count())):
-                self.titles.addItem(f"タイトル {i + 1}", i)
+            for title_id, duration in self.engine.titles():
+                self.titles.addItem(f"タイトル {title_id + 1} ({timestamp(duration)})", title_id)
         p.video_set_spu(-1)
         self.engine.pause()
         if p.is_seekable():
@@ -498,7 +498,8 @@ class MainWindow(QMainWindow):
             if self.preparing:
                 if state == self.engine.vlc.State.Error or time.monotonic() - self.prepared_at > 20:
                     self._playback_failed()
-                elif state in (self.engine.vlc.State.Playing, self.engine.vlc.State.Paused):
+                elif (state in (self.engine.vlc.State.Playing, self.engine.vlc.State.Paused)
+                      and p.get_title() == self.title_id + 1 and p.get_length() > 0):
                     self._finish_preparing()
             elif self.ready:
                 if state == self.engine.vlc.State.Error:

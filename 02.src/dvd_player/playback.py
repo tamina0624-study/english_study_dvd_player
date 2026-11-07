@@ -60,10 +60,16 @@ class Player:
         if self.media:
             self.media.release()
         location = drive.replace("\\", "/").rstrip("/")
-        self.media = self.instance.media_new(f"dvdsimple:///{location}/@{title + 1}")
+        self.media = self.instance.media_new(f"dvd:///{location}/#{title + 1}")
         self.player.set_media(self.media)
         if self.player.play() == -1:
             raise RuntimeError("DVDの再生を開始できませんでした。")
+
+    def titles(self):
+        descriptions = self.player.get_full_title_descriptions() or []
+        # VLC's index zero is the DVD menu; real DVD titles start at index one.
+        return [(i - 1, description.duration) for i, description in enumerate(descriptions)
+                if i > 0 and not (description.flags & 1)]
 
     def play(self):
         if self.player.play() == -1:

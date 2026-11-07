@@ -64,6 +64,8 @@ class ExtractionTests(unittest.TestCase):
         inputs = dvd_input("D:/", 2)
         self.assertEqual(inputs[inputs.index("-title") + 1], "3")
         self.assertEqual(inputs[inputs.index("-trim") + 1], "0")
+        self.assertEqual(inputs[-1], "D:")
+        self.assertEqual(dvd_input("D:\\", 0)[-1], "D:")
         with self.assertRaises(ValueError):
             dvd_input("D:/", -1)
 
