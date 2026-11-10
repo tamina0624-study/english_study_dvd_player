@@ -4,7 +4,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pathlib import Path
 import tempfile
 import logging
-from types import SimpleNamespace
+from concurrent.futures import Future
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -142,9 +142,11 @@ class WindowTests(unittest.TestCase):
         self.window._rewind()
         self.window._update_playback()
         self.window.engine.seek.assert_called_once_with(6000)
+        self.window.engine.play.assert_called_once()
+        self.window.engine.pause.assert_not_called()
         p.get_time.return_value = 6000
         self.window._update_playback()
-        self.window.engine.play.assert_not_called()
+        self.window.engine.pause.assert_called_once()
 
     def test_cached_tracks_can_switch_without_changing_playback(self):
         first = CueIndex([Cue("a", 0, 1000, Path("unused"))])
@@ -180,6 +182,7 @@ class WindowTests(unittest.TestCase):
         self.window.ready = True
         self.window.media_id = "test"
         self.window._media_removed()
+        self.window.navigation_job.result(timeout=2)
         self.assertFalse(self.window.ready)
         self.assertTrue(self.window.media_cancel.is_set())
         self.assertFalse(self.window.play_button.isEnabled())
@@ -192,19 +195,102 @@ class WindowTests(unittest.TestCase):
         self.window._sync(1000)
         self.assertEqual(self.window.coverage_status.text(), "")
 
-    def test_chapter_change_uses_start_time_and_preserves_pause(self):
+    def test_chapter_change_runs_outside_gui_and_does_not_poll_busy_vlc(self):
         self.window.engine = MagicMock()
         self.window.ready = True
         p = self.window.engine.player
-        p.get_chapter.return_value = 0
-        p.get_chapter_count.return_value = 2
-        p.is_seekable.return_value = True
+        p.get_chapter.return_value = 1
+        p.get_chapter_count.return_value = 3
+        p.get_length.return_value = 2000000
+        job = Future()
+        with patch.object(self.window.navigation_executor, "submit", return_value=job) as submit:
+            self.window._chapter(1)
+            submit.assert_called_once_with(self.window.engine.change_chapter, 1, None)
+            self.window._tick()
+            self.window._chapter(1)
+            submit.assert_called_once()
+        self.assertEqual(p.mock_calls, [])
+        self.assertFalse(self.window.ready)
+        self.assertFalse(self.window.open_button.isEnabled())
+        self.assertFalse(self.window.volume.isEnabled())
+        job.set_result(None)
+        with patch.object(self.window, "_update_playback"):
+            self.window._tick()
+        self.assertTrue(self.window.ready)
+        self.assertIsNone(self.window.navigation_job)
+
+    def test_chapter_worker_preserves_pending_pause_and_reports_failure(self):
+        self.window.engine = MagicMock()
+        self.window.ready = True
+        self.window.engine.player.get_chapter.return_value = 0
+        self.window.engine.player.get_chapter_count.return_value = 3
+        self.window.engine.player.get_length.return_value = 2000000
+        self.window.seek.request(1000, False)
+        job = Future()
+        with patch.object(self.window.navigation_executor, "submit", return_value=job) as submit:
+            self.window._chapter(-1)
+            submit.assert_called_once_with(self.window.engine.change_chapter, -1, False)
+        job.set_exception(RuntimeError("navigation failed"))
+        with patch.object(self.window, "_update_playback"):
+            self.window._tick()
+        self.assertTrue(self.window.ready)
+        self.assertIsNone(self.window.seek.target)
+        self.assertIn("移動できません", self.window.statusBar().currentMessage())
+
+    def test_title_selection_does_not_stop_or_open_vlc_on_gui_thread(self):
+        self.window.engine = MagicMock()
+        self.window.ready = True
+        self.window.titles.addItem("Title 1", 0)
+        self.window.titles.addItem("Title 2", 1)
+        self.window.loaded_drive = "D:/"
+        job = Future()
+        with patch.object(self.window.navigation_executor, "submit", return_value=job) as submit:
+            self.window._select_title(1)
+            submit.assert_called_once_with(self.window.engine.open, "D:/", 1, volume=0)
+            self.window._tick()
+        self.assertEqual(self.window.engine.method_calls, [])
+        self.assertFalse(self.window.ready)
+        self.assertTrue(self.window.preparing)
+        self.assertFalse(self.window.titles.isEnabled())
+        job.set_result(None)
+
+    def test_identity_completion_does_not_poll_vlc_after_starting_open(self):
+        self.window.engine = MagicMock()
+        identity = Future()
+        identity.set_result("disc-id")
+        self.window.jobs.append(("identity", self.window.generation, identity))
+        opening = Future()
+        with patch.object(self.window.navigation_executor, "submit", return_value=opening):
+            self.window._tick()
+        self.assertEqual(self.window.engine.method_calls, [])
+        self.assertEqual(self.window.navigation_kind, "open")
+        opening.set_result(None)
+
+    def test_slow_navigation_records_diagnostics_once_without_polling_vlc(self):
+        self.window.engine = MagicMock()
+        self.window.ready = True
+        job = Future()
+        with patch.object(self.window.navigation_executor, "submit", return_value=job):
+            self.window._chapter(1)
+        self.window.navigation_started = 0
+        with patch("dvd_player.diagnostics.dump_threads") as dump:
+            self.window._tick()
+            self.window._tick()
+            dump.assert_called_once()
+        self.assertEqual(self.window.engine.method_calls, [])
+        job.set_result(None)
+
+    def test_failed_paused_seek_restores_pause(self):
+        self.window.engine = MagicMock()
+        p = self.window.engine.player
         p.is_playing.return_value = False
-        p.get_full_chapter_descriptions.return_value = [SimpleNamespace(time_offset=0),
-                                                       SimpleNamespace(time_offset=1332000)]
-        self.window._chapter(1)
-        self.assertEqual(self.window.seek.target, 1332000)
-        self.assertFalse(self.window.seek.resume)
+        p.get_time.return_value = 10000
+        p.get_length.return_value = 2000000
+        self.window.seek.request(1332000, False)
+        self.window.engine.seek.side_effect = RuntimeError("seek failed")
+        self.window._update_playback()
+        self.window.engine.pause.assert_called_once()
+        self.assertIsNone(self.window.seek.target)
 
     def test_complete_empty_track_has_explicit_message(self):
         self.window._display_track(CueIndex(), "ja")

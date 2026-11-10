@@ -1,6 +1,7 @@
 """LibVLC adapter. Import failures are reported in the application window."""
 import ctypes
 import hashlib
+import logging
 import os
 from pathlib import Path
 
@@ -68,15 +69,26 @@ class Player:
             self.player.set_hwnd(handle)
         self.player.audio_set_volume(70)
 
-    def open(self, drive: str, title: int = 0):
+    def open(self, drive: str, title: int = 0, *, volume: int | None = None):
         self.player.stop()
         if self.media:
             self.media.release()
         location = Path(drive).resolve().as_uri().replace("file:", "dvd:", 1).rstrip("/")
         self.media = self.instance.media_new(f"{location}/#{title + 1}")
         self.player.set_media(self.media)
+        if volume is not None:
+            self.player.audio_set_volume(volume)
         if self.player.play() == -1:
             raise RuntimeError("DVDの再生を開始できませんでした。")
+
+    def prepare(self, volume: int, include_titles: bool):
+        titles = self.titles() if include_titles else []
+        self.player.video_set_spu(-1)
+        self.pause()
+        # Opening a DVD title already starts at its beginning. A second time
+        # seek while paused can stall DVD input and is unnecessary here.
+        self.player.audio_set_volume(volume)
+        return titles
 
     def titles(self):
         descriptions = self.player.get_full_title_descriptions() or []
@@ -94,6 +106,22 @@ class Player:
     def seek(self, ms: int):
         if self.player.set_time(ms) == -1:
             raise RuntimeError("再生位置を変更できませんでした。")
+
+    def change_chapter(self, delta: int, resume: bool | None = None):
+        """Run on the navigation worker, never on the GUI thread."""
+        logger = logging.getLogger("dvd_player")
+        logger.info("CHAPTER_QUERY delta=%s", delta)
+        target = self.player.get_chapter() + delta
+        if not 0 <= target < self.player.get_chapter_count():
+            return
+        if resume is None:
+            resume = bool(self.player.is_playing())
+        logger.info("CHAPTER_MOVE target=%s resume=%s", target, resume)
+        # Use DVD navigation rather than converting chapter offsets to a time
+        # seek. Do not hold up Qt's event loop while LibVLC changes the input.
+        self.player.set_chapter(target)
+        self.play() if resume else self.pause()
+        logger.info("CHAPTER_DONE target=%s", target)
 
     def close(self):
         self.player.stop()

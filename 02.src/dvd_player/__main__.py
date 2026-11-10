@@ -21,6 +21,11 @@ def main():
     app.setApplicationName("English DVD Player")
     app.setOrganizationName("dvd_player")
     configure_font(app)
+    from dvd_player.diagnostics import install_hang_diagnostics
+    from dvd_player.storage import app_data_dir, setup_logging
+    logger = setup_logging(app_data_dir())
+    logger.info("APPLICATION_STARTED pid=%s source=%s", os.getpid(), Path(__file__).resolve())
+    install_hang_diagnostics(app, app_data_dir())
     window = MainWindow()
     window.show()
     return app.exec()

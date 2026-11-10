@@ -46,6 +46,11 @@ class MainWindow(QMainWindow):
         self.media_executor = ThreadPoolExecutor(max_workers=1)
         self.last_media_check = time.monotonic()
         self.seek = SeekCoordinator()
+        self.navigation_executor = ThreadPoolExecutor(max_workers=1)
+        self.navigation_job = None
+        self.navigation_kind = None
+        self.navigation_started = 0
+        self.navigation_reported = False
         self.indexes = {"en": CueIndex(), "ja": CueIndex()}
         self.tracks = {"en": [], "ja": []}
         self.selected_tracks = {"en": None, "ja": None}
@@ -314,8 +319,9 @@ class MainWindow(QMainWindow):
         self.extract_button.setEnabled(available and bool(self.media_id) and not self.extracting)
         self.cancel_extract_button.setEnabled(self.extracting)
         self.assign_language_button.setEnabled(available and bool(self.unknown_tracks))
-        self.open_button.setEnabled(self.engine is not None and not self.preparing)
-        self.folder_button.setEnabled(self.engine is not None and not self.preparing)
+        self.open_button.setEnabled(self.engine is not None and not self.preparing and self.navigation_job is None)
+        self.folder_button.setEnabled(self.engine is not None and not self.preparing and self.navigation_job is None)
+        self.volume.setEnabled(self.navigation_job is None)
         chapter = self.engine.player.get_chapter() if available else -1
         count = self.engine.player.get_chapter_count() if available else 0
         self.previous.setEnabled(available and chapter > 0)
@@ -352,7 +358,7 @@ class MainWindow(QMainWindow):
             self._open_source(str(directory))
 
     def _open_source(self, source):
-        if not self.engine:
+        if not self.engine or self.navigation_job is not None:
             return
         self._cancel_extraction()
         self.media_cancel.set()
@@ -366,7 +372,7 @@ class MainWindow(QMainWindow):
         self.title_id = 0
         self.titles.clear()
         self._reset_subtitles()
-        self.engine.player.stop()
+        self._begin_navigation("stop", self.engine.player.stop)
         drive = source
         self.loaded_drive = drive
         self.jobs.append(("identity", self.generation,
@@ -378,14 +384,12 @@ class MainWindow(QMainWindow):
 
     def _start_title(self):
         self.seek.clear()
-        self.engine.open(self.loaded_drive, self.title_id)
-        self.engine.player.audio_set_volume(0)
         self.preparing = True
         self.prepared_at = time.monotonic()
-        self.ready = False
+        self._begin_navigation("open", self.engine.open, self.loaded_drive, self.title_id, volume=0)
 
     def _select_title(self, index):
-        if not self.engine or index < 0:
+        if not self.engine or index < 0 or self.navigation_job is not None:
             return
         self._cancel_extraction()
         self.generation += 1
@@ -399,15 +403,11 @@ class MainWindow(QMainWindow):
             self._playback_failed()
 
     def _finish_preparing(self):
-        p = self.engine.player
-        if self.titles.count() == 0:
-            for title_id, duration in self.engine.titles():
-                self.titles.addItem(f"タイトル {title_id + 1} ({timestamp(duration)})", title_id)
-        p.video_set_spu(-1)
-        self.engine.pause()
-        if p.is_seekable():
-            self.engine.seek(0)
-        p.audio_set_volume(self.volume.value())
+        self._begin_navigation("prepare", self.engine.prepare, self.volume.value(), self.titles.count() == 0)
+
+    def _complete_preparing(self, titles):
+        for title_id, duration in titles:
+            self.titles.addItem(f"タイトル {title_id + 1} ({timestamp(duration)})", title_id)
         self.preparing = False
         self.ready = self.loaded = True
         self.subtitle_status.setText("保存済み字幕を確認しています…")
@@ -458,23 +458,26 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._seek_slider)
 
     def _chapter(self, delta):
-        if not self.ready:
+        if not self.ready or self.navigation_job is not None:
             return
-        p = self.engine.player
-        target = p.get_chapter() + delta
-        if 0 <= target < p.get_chapter_count():
-            resume = self.seek.resume if self.seek.target is not None else bool(p.is_playing())
-            self.seek.clear()
-            descriptions = list(p.get_full_chapter_descriptions(self.title_id + 1) or [])
-            if p.is_seekable() and target < len(descriptions):
-                self.seek.request(descriptions[target].time_offset, resume)
-                return
-            p.set_chapter(target)
-            self.engine.play() if resume else self.engine.pause()
-            self.active_rows = {"en": None, "ja": None}
+        resume = self.seek.resume if self.seek.target is not None else None
+        self.seek.clear()
+        self._begin_navigation("chapter", self.engine.change_chapter, delta, resume)
+        self.statusBar().showMessage("チャプターを移動中…")
+
+    def _begin_navigation(self, kind, function, *args, **kwargs):
+        if self.navigation_job is not None:
+            raise RuntimeError("DVD操作の完了を待ってください。")
+        self.logger.info("NAVIGATION_BEGIN kind=%s title=%s", kind, self.title_id)
+        self.ready = False
+        self.navigation_kind = kind
+        self.navigation_started = time.monotonic()
+        self.navigation_reported = False
+        self.navigation_job = self.navigation_executor.submit(function, *args, **kwargs)
+        self._set_controls(False)
 
     def _volume_changed(self, value):
-        if self.engine and not self.preparing:
+        if self.engine and not self.preparing and self.navigation_job is None:
             self.engine.player.audio_set_volume(value)
 
     def _enable_follow(self):
@@ -745,6 +748,36 @@ class MainWindow(QMainWindow):
             if ms >= 0 and not selected_index.covers(ms) else "")
 
     def _tick(self):
+        # Even VLC getters can wait on its input lock. Do not poll the player
+        # or process media replacement jobs until navigation has returned.
+        if self.navigation_job is not None:
+            if not self.navigation_job.done():
+                if not self.navigation_reported and time.monotonic() - self.navigation_started > 10:
+                    from dvd_player.diagnostics import dump_threads
+                    self.navigation_reported = True
+                    self.logger.error("NAVIGATION_STALLED kind=%s title=%s", self.navigation_kind, self.title_id)
+                    dump_threads(app_data_dir())
+                    self.statusBar().showMessage("DVDの応答を待っています。診断ログを保存しました。")
+                return
+            job, kind = self.navigation_job, self.navigation_kind
+            self.navigation_job = self.navigation_kind = None
+            try:
+                result = job.result()
+                self.logger.info("NAVIGATION_DONE kind=%s title=%s", kind, self.title_id)
+                if kind == "chapter":
+                    self.ready = True
+                    self.active_rows = {"en": None, "ja": None}
+                    self.statusBar().showMessage("チャプターを移動しました。", 3000)
+                elif kind == "prepare":
+                    self._complete_preparing(result)
+            except Exception:
+                self.logger.exception("NAVIGATION_FAILED kind=%s", kind)
+                if kind == "chapter":
+                    self.ready = True
+                    self.statusBar().showMessage("チャプターを移動できませんでした。", 6000)
+                else:
+                    self.preparing = False
+                    self.statusBar().showMessage("DVDの読み込みに失敗しました。開き直してください。", 6000)
         if (self.ready and time.monotonic() - self.last_media_check > 3
                 and not any(kind == "presence" for kind, _, _ in self.jobs)):
             self.last_media_check = time.monotonic()
@@ -827,7 +860,10 @@ class MainWindow(QMainWindow):
                     self._error("DVDを読み込めません。媒体とドライブを確認してください。")
                 else:
                     self.subtitle_status.setText(str(error) if isinstance(error, ValueError) else "字幕を読み込めません。形式と画像を確認してください。")
-        if not self.engine:
+        if not self.engine or self.navigation_job is not None:
+            return
+        if not (self.preparing or self.ready):
+            self._set_controls(False)
             return
         try:
             p = self.engine.player
@@ -856,16 +892,17 @@ class MainWindow(QMainWindow):
         try:
             command = self.seek.next_command(actual)
             if command is not None:
-                self.engine.pause()
+                # DVD navigation needs the input/decoder to advance. Seeking
+                # while paused can leave VLC waiting for a position update.
+                if not p.is_playing():
+                    self.engine.play()
                 self.engine.seek(command)
             elif pending and self.seek.target is None:
-                if self.seek.resume:
-                    self.engine.play()
+                self.engine.play() if self.seek.resume else self.engine.pause()
         except (TimeoutError, RuntimeError) as error:
             resume = self.seek.resume
             self.seek.clear()
-            if resume:
-                self.engine.play()
+            self.engine.play() if resume else self.engine.pause()
             self.statusBar().showMessage(str(error), 6000)
         self.time_label.setText(f"{timestamp(actual)} / {timestamp(duration)}")
         if duration > 0 and actual >= 0 and not self.slider.isSliderDown():
@@ -889,7 +926,7 @@ class MainWindow(QMainWindow):
         self.seek.clear()
         self._reset_subtitles()
         self.titles.clear()
-        self.engine.player.stop()
+        self._begin_navigation("stop", self.engine.player.stop)
         self.time_label.setText("--:-- / --:--")
         self.slider.setValue(0)
         self.subtitle_status.setText("DVDが取り出されたか、読み取れなくなりました。")
@@ -904,12 +941,16 @@ class MainWindow(QMainWindow):
         self.ready = self.loaded = self.preparing = False
         self.seek.clear()
         self._reset_subtitles()
-        if self.engine:
-            self.engine.player.stop()
+        if self.engine and self.navigation_job is None:
+            self._begin_navigation("stop", self.engine.player.stop)
         self._set_controls(False)
         self._error("DVD再生に失敗しました。媒体・リージョン・VLCを確認して再度読み込んでください。")
 
     def closeEvent(self, event):
+        if self.navigation_job is not None and not self.navigation_job.done():
+            self.statusBar().showMessage("DVD操作の完了後に閉じてください。")
+            event.ignore()
+            return
         self._cancel_extraction()
         self.media_cancel.set()
         self.generation += 1
@@ -919,6 +960,7 @@ class MainWindow(QMainWindow):
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.editor_executor.shutdown(wait=False, cancel_futures=True)
         self.media_executor.shutdown(wait=False, cancel_futures=True)
+        self.navigation_executor.shutdown(wait=False, cancel_futures=True)
         if self.engine:
             self.engine.close()
         event.accept()
