@@ -12,6 +12,7 @@ import threading
 import time
 
 from PySide6.QtGui import QImage
+from dvd_player.storage import key
 
 
 class ExtractionCancelled(Exception):
@@ -71,13 +72,14 @@ def run_tool(args: list[str], cancel: threading.Event, timeout: int = 900,
                     process.wait(timeout=3)
 
 
-def dvd_input(source: str, title_id: int) -> list[str]:
+def dvd_input(source: str, title_id: int, start_ms: int = 0) -> list[str]:
     if type(title_id) is not int or title_id < 0:
         raise ValueError("タイトル番号が不正です。")
     # Keep initial padding cells so that time zero matches title playback.
     if re.fullmatch(r"[A-Za-z]:[\\/]*", source):
         source = source[:2]
-    return ["-f", "dvdvideo", "-title", str(title_id + 1), "-trim", "0", "-i", source]
+    seek = ["-ss", f"{start_ms / 1000:.3f}"] if start_ms > 0 else []
+    return [*seek, "-f", "dvdvideo", "-title", str(title_id + 1), "-trim", "0", "-i", source]
 
 
 def checked_identity(source, cancel):
@@ -133,20 +135,32 @@ def bitmap_bounds(image: QImage):
 
 
 def frames_to_manifest(directory: Path, media_id: str, title_id: int, language: str,
-                       track_id: str, duration_ms: int | None, cancel: threading.Event, *, complete=True) -> Path:
+                       track_id: str, duration_ms: int | None, cancel: threading.Event, *, complete=True,
+                       previous=None) -> Path:
     """Transparent frames end a cue; repeated identical images do not create new cues."""
     files = sorted((p for p in directory.glob("*.png") if p.stem.lstrip("-").isdigit()),
                    key=lambda path: int(path.stem))
     if not complete:
         files = files[:-2]  # The newest files may still be written by the PNG encoder.
     cues = []
+    boundary = 0
+    if previous is not None:
+        for cue in previous.cues:
+            if cancel.is_set():
+                raise ExtractionCancelled()
+            target = f"prefix-{len(cues):06}.png"
+            if not (directory / target).exists():
+                shutil.copyfile(cue.image, directory / target)
+            cues.append(dict(cue_id=f"cue-{len(cues):06}", start_ms=cue.start_ms,
+                             end_ms=cue.end_ms, image_path=target))
+        boundary = max((cue.end_ms for cue in previous.cues), default=0)
     current = None
     previous_time = -1
     for path in files:
         if cancel.is_set():
             raise ExtractionCancelled()
         position = int(path.stem)
-        if position < 0:
+        if position < boundary:
             continue
         if position <= previous_time:
             raise ValueError("字幕画像の時刻が重複しています。")
@@ -181,6 +195,8 @@ def frames_to_manifest(directory: Path, media_id: str, title_id: int, language: 
     data = dict(schema_version=1, media_id=media_id, title_id=title_id, language=language,
                 track_id=track_id, complete=complete, cues=cues)
     if not complete:
+        previous_time = max(previous_time, max((end for _, end in previous.coverage), default=0)
+                            if previous is not None else 0)
         if previous_time <= 0:
             raise ValueError("字幕の取得済み範囲がまだありません。")
         data["coverage"] = [dict(start_ms=0, end_ms=previous_time)]
@@ -224,11 +240,28 @@ class DvdSubtitleExtractor:
             stream["language"] = language
             selected.append(stream)
         notify("unknown", unknown)
+        cached = {track.track_id: track for track in self.cache.load_tracks(media_id, title_id)}
+        pending = []
+        starts = []
+        for stream in selected:
+            track = cached.get(key(f"dvd:{stream['language']}:{stream['index']}"))
+            if track is not None and track.index.complete:
+                results.append(track)
+                notify("track", track)
+                continue
+            stream["previous"] = track.index if track is not None else None
+            # Re-read the last saved cue, including its clear frame, to avoid
+            # losing a subtitle at the seek boundary. Keep title timestamps.
+            position = track.index.cues[-1].start_ms if track and track.index.cues else 0
+            starts.append(max(0, position - 2000))
+            pending.append(stream)
+        selected = pending
         if not selected:
-            return [], unknown
+            return results, unknown
+        start_ms = min(starts)
         with tempfile.TemporaryDirectory(prefix="dvd-subtitles-") as temp:
             root = Path(temp)
-            command = render_tracks_command(ffmpeg, dvd_input(source, title_id), selected, root)
+            command = render_tracks_command(ffmpeg, dvd_input(source, title_id, start_ms), selected, root)
             last_preview = 0
             previous_counts = {}
             def preview():
@@ -243,7 +276,8 @@ class DvdSubtitleExtractor:
                     if count < 4 or count == previous_counts.get(stream["index"]):
                         continue
                     manifest = frames_to_manifest(directory, media_id, title_id, stream["language"],
-                                                  str(stream["index"]), duration_ms, cancel, complete=False)
+                                                  str(stream["index"]), duration_ms, cancel, complete=False,
+                                                  previous=stream["previous"])
                     track = self.cache.save_snapshot(manifest, media_id, title_id)
                     notify("track", track)
                     previous_counts[stream["index"]] = count
@@ -251,14 +285,16 @@ class DvdSubtitleExtractor:
                 if positions:
                     seconds = max(positions) // 1000
                     notify("progress", f"字幕取得中：{seconds // 60:02}:{seconds % 60:02}付近まで確認済み（途中の字幕も表示できます）")
-            notify("progress", f"{len(selected)}トラックの字幕をまとめて取得中…")
+            notify("progress", f"{start_ms // 60000:02}:{start_ms // 1000 % 60:02}付近から字幕取得を再開中…"
+                   if start_ms else f"{len(selected)}トラックの字幕をまとめて取得中…")
             read_timeout = min(7200, max(900, (duration_ms or 0) // 500))
             run_tool(command, cancel, timeout=read_timeout, image_directory=root, on_poll=preview)
             if checked_identity(source, cancel) != media_id:
                 raise ValueError("取得中にDVDが変更されました。読み込み直してください。")
             for stream in selected:
                 manifest = frames_to_manifest(root / str(stream["index"]), media_id, title_id,
-                                              stream["language"], str(stream["index"]), duration_ms, cancel)
+                                              stream["language"], str(stream["index"]), duration_ms, cancel,
+                                              previous=stream["previous"])
                 track = self.cache.save_snapshot(manifest, media_id, title_id)
                 results.append(track)
                 notify("track", track)

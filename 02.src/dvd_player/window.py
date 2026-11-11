@@ -172,6 +172,7 @@ class MainWindow(QMainWindow):
         listing.setResizeMode(QListWidget.ResizeMode.Adjust)
         listing.setIconSize(QSize(600, 64))
         listing.setWordWrap(True)
+        listing.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
         listing.verticalScrollBar().sliderPressed.connect(self._manual_scroll)
         listing.viewport().installEventFilter(self)
         listing.itemClicked.connect(self._select_subtitle_item)
@@ -485,10 +486,25 @@ class MainWindow(QMainWindow):
         self.follow_button.setChecked(True)
         self.follow_button.setToolTip("自動スクロール中。字幕一覧を手動でスクロールすると停止します。")
         self.active_rows = {"en": None, "ja": None}
+        self._follow_current_subtitle()
+        self._load_visible_images(self.subtitle_list)
+
+    def _follow_current_subtitle(self):
         rows = self.highlight_rows["en"] | self.highlight_rows["ja"]
-        if rows:
-            self.subtitle_list.scrollToItem(self.subtitle_list.item(min(rows)),
-                                           QListWidget.ScrollHint.PositionAtCenter)
+        if not self.follow or not rows:
+            return
+        listing = self.subtitle_list
+        item = listing.item(min(rows))
+        # Icon updates and resizing can leave a pending layout. Resolve it
+        # before positioning the current cue, especially after manual scrolling.
+        rect = listing.visualItemRect(item)
+        viewport = listing.viewport().rect()
+        if not viewport.contains(rect):
+            listing.doItemsLayout()
+            rect = listing.visualItemRect(item)
+            listing.scrollToItem(item, QListWidget.ScrollHint.PositionAtTop
+                                 if rect.height() > viewport.height() else
+                                 QListWidget.ScrollHint.PositionAtCenter)
 
     def _import_subtitles(self):
         language = self.active_language
@@ -685,13 +701,28 @@ class MainWindow(QMainWindow):
         # Load only visible rows; pixmaps outside the viewport are released.
         viewport = listing.viewport().rect()
         display_size = QSize(max(100, min(600, viewport.width() - 70)), 64)
-        listing.setIconSize(display_size)
+        if listing.iconSize() != display_size:
+            listing.setIconSize(display_size)
+            # Loaded pixmaps were scaled for the previous viewport width.
+            for row in self.image_rows:
+                listing.item(row).setIcon(QIcon())
+                listing.item(row).setData(Qt.ItemDataRole.UserRole + 1, False)
+            listing.doItemsLayout()
         from PySide6.QtCore import QPoint
-        first = listing.indexAt(QPoint(1, 1)).row()
-        first = max(0, first)
+        # The viewport corner can fall in an item's margin or list padding.
+        # In that case indexAt returns -1 even far down the list; falling back
+        # to row zero would leave every visible subtitle image unloaded.
+        first = -1
+        for y in range(viewport.top(), viewport.bottom() + 1):
+            first = listing.indexAt(QPoint(viewport.center().x(), y)).row()
+            if first >= 0:
+                break
         visible_rows = set()
-        for i in range(first, min(listing.count(), first + 30)):
-            if listing.visualItemRect(listing.item(i)).intersects(viewport):
+        for i in range(max(0, first), listing.count()) if first >= 0 else ():
+            rect = listing.visualItemRect(listing.item(i))
+            if rect.top() > viewport.bottom():
+                break
+            if rect.intersects(viewport):
                 visible_rows.add(i)
         for i in visible_rows | self.image_rows:
             item = listing.item(i)
@@ -737,9 +768,7 @@ class MainWindow(QMainWindow):
             item.setForeground(QColor("white") if is_active else QColor("#c8d6e8"))
         self.highlight_rows = active_rows
         self.follow_button.setChecked(self.follow)
-        if self.follow and highlighted:
-            self.subtitle_list.scrollToItem(self.subtitle_list.item(min(highlighted)),
-                                           QListWidget.ScrollHint.PositionAtCenter)
+        self._follow_current_subtitle()
         self._load_visible_images(self.subtitle_list)
         selected = self.active_language
         selected_index = self.indexes[selected]

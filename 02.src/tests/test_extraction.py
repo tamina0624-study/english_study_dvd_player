@@ -123,6 +123,51 @@ class ExtractionTests(unittest.TestCase):
         self.assertTrue(index.covers(1500))
         self.assertFalse(index.covers(3000))
 
+    def test_resume_seeks_merges_previews_and_skips_completed_track(self):
+        self.frame(10000)
+        self.frame(12000, False)
+        self.frame(14000, False)
+        self.frame(15000, False)
+        cache = CacheStore(self.root / "cache")
+        manifest = frames_to_manifest(self.root, "media", 0, "en", "2", 30000,
+                                      self.cancel, complete=False)
+        original = cache.save_snapshot(manifest, "media", 0)
+        original_image = original.index.cues[0].image.read_bytes()
+        metadata = dict(format=dict(duration="30"), streams=[
+            dict(index=2, codec_type="subtitle", codec_name="dvd_subtitle", tags=dict(language="eng"))])
+        renders = []
+        def fake_run(args, cancel, timeout=900, image_directory=None, on_poll=None):
+            if "-demuxers" in args:
+                return b" D dvdvideo"
+            if "-show_streams" in args:
+                return json.dumps(metadata).encode()
+            renders.append(args)
+            self.assertLess(args.index("-ss"), args.index("-i"))
+            self.assertEqual(args[args.index("-ss") + 1], "8.000")
+            image = QImage(2, 2, QImage.Format.Format_RGBA8888)
+            for timestamp, color in [(10000, "white"), (12000, "transparent"),
+                                     (20000, "red"), (21000, "transparent"),
+                                     (22000, "transparent"), (23000, "transparent")]:
+                image.fill(QColor(color))
+                image.save(str(image_directory / "2" / f"{timestamp:012}.png"))
+            on_poll()
+            preview = cache.load_tracks("media", 0)[0]
+            self.assertFalse(preview.index.complete)
+            self.assertEqual([(c.start_ms, c.end_ms) for c in preview.index.cues],
+                             [(10000, 12000), (20000, 21000)])
+            return b""
+        with patch("dvd_player.extraction.find_tool", side_effect=lambda name: name), \
+                patch("dvd_player.extraction.checked_identity", return_value="media"), \
+                patch("dvd_player.extraction.run_tool", side_effect=fake_run):
+            extractor = DvdSubtitleExtractor(cache)
+            tracks, _ = extractor.extract("D:/", "media", 0, self.cancel, lambda *args: None)
+            self.assertTrue(tracks[0].index.complete)
+            self.assertEqual(tracks[0].index.cues[0].image.read_bytes(), original_image)
+            self.assertEqual([(c.start_ms, c.end_ms) for c in tracks[0].index.cues],
+                             [(10000, 12000), (20000, 21000)])
+            extractor.extract("D:/", "media", 0, self.cancel, lambda *args: None)
+        self.assertEqual(len(renders), 1)
+
     def test_identity_helper_output_is_validated(self):
         with patch("dvd_player.extraction.run_tool", return_value=b""):
             with self.assertRaises(ValueError):

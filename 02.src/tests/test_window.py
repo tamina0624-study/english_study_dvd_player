@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from PySide6.QtGui import QImage, QPainter, QColor
-from PySide6.QtCore import QCoreApplication, QEvent, QRect
+from PySide6.QtCore import QCoreApplication, QEvent, QRect, QModelIndex
 from PySide6.QtWidgets import QApplication, QAbstractSlider, QStyleOptionViewItem
 
 from dvd_player.core import Cue, CueIndex
@@ -83,6 +83,37 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(self.window.follow_button.isChecked())
         rect = self.window.subtitle_list.visualItemRect(self.window.subtitle_list.item(25))
         self.assertTrue(self.window.subtitle_list.viewport().rect().intersects(rect))
+
+    def test_follow_resume_loads_images_when_viewport_corner_is_padding(self):
+        path = Path(self.temp.name) / "subtitle.png"
+        image = QImage(160, 50, QImage.Format.Format_RGB32)
+        image.fill(QColor("white"))
+        self.assertTrue(image.save(str(path)))
+        cues = [Cue(str(i), i * 2000, i * 2000 + 1500, path) for i in range(80)]
+        self.window._apply_subtitles((CueIndex(cues), "en"))
+        self.window.show()
+        self.app.processEvents()
+        listing = self.window.subtitle_list
+        real_index_at = listing.indexAt
+        # A corner inside list padding must not make image loading restart at 0.
+        def index_at(point):
+            return QModelIndex() if point.x() <= 1 else real_index_at(point)
+        with patch.object(listing, "indexAt", side_effect=index_at):
+            self.window._sync(0)
+            self.window._manual_scroll()
+            listing.verticalScrollBar().setValue(0)
+            self.window._sync(120000)
+            self.assertTrue(listing.item(60).icon().isNull())
+            self.window.follow_button.click()
+            # Resume must load the image immediately, including while paused.
+            self.assertFalse(listing.item(60).icon().isNull())
+            for _ in range(3):
+                self.app.processEvents()
+                self.window._sync(120000)
+                rect = listing.visualItemRect(listing.item(60))
+                self.assertTrue(listing.viewport().rect().intersects(rect))
+                self.assertFalse(listing.item(60).icon().isNull())
+            self.assertTrue(listing.item(0).icon().isNull())
 
     def test_english_and_japanese_subtitles_share_one_wide_list(self):
         with tempfile.TemporaryDirectory() as temp:
